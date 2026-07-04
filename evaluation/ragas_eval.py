@@ -2,14 +2,15 @@
 
 Builds an evaluation dataset by running ``run_analyst_lc`` over the project's
 question bank, then scores it with Ragas reference-free and reference-based
-metrics. Ragas needs an LLM judge, so when ``OPENAI_API_KEY`` is absent the run
-is skipped gracefully and a placeholder summary is written instead of crashing.
+metrics. Ragas needs an LLM judge, resolved via
+:func:`utils.llm_provider.get_chat_model` (OpenAI -> Groq -> Ollama). When no
+provider is configured/reachable, the run is skipped gracefully and a
+placeholder summary is written instead of crashing.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -69,19 +70,21 @@ def run_ragas_evaluation(limit: int = 20) -> dict[str, Any]:
 
     dataset = build_ragas_dataset(limit=limit)
 
-    if not os.getenv("OPENAI_API_KEY"):
+    from utils.llm_provider import get_chat_model
+
+    choice = get_chat_model()
+    if choice is None:
         print(
-            "Ragas evaluation requires an LLM judge (set OPENAI_API_KEY). "
-            "Skipping and writing a placeholder summary."
+            "Ragas evaluation requires an LLM judge (set OPENAI_API_KEY, GROQ_API_KEY, "
+            "or run Ollama locally). Skipping and writing a placeholder summary."
         )
-        summary = {"status": "skipped", "reason": "no OPENAI_API_KEY"}
+        summary = {"status": "skipped", "reason": "no LLM provider available"}
         summary_path.write_text(json.dumps(summary, indent=2))
         return summary
 
     from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_openai import ChatOpenAI
 
-    judge_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini", temperature=0))
+    judge_llm = LangchainLLMWrapper(choice.llm)
     judge_embeddings = LangchainEmbeddingsWrapper(HuggingFaceEmbeddings(model_name=EMBED_MODEL))
 
     # NOTE: ragas 0.4.x requires metric *instances* (the spec listed the classes).
@@ -102,7 +105,12 @@ def run_ragas_evaluation(limit: int = 20) -> dict[str, Any]:
     results_df = result.to_pandas()
     results_df.to_csv(OUTPUT_DIR / "ragas_results.csv", index=False)
 
-    summary: dict[str, Any] = {"status": "completed", "rows": int(len(results_df))}
+    summary: dict[str, Any] = {
+        "status": "completed",
+        "rows": int(len(results_df)),
+        "judge_provider": choice.provider,
+        "judge_model": choice.model_name,
+    }
     for metric in metrics:
         if metric.name in results_df.columns:
             summary[metric.name] = round(float(results_df[metric.name].mean()), 4)

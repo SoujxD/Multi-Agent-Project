@@ -23,7 +23,7 @@ demos and grading work without any paid models.
 
 ## Stack
 
-- **LLM:** `ChatOpenAI` (gpt-4o-mini) via LangChain, or OpenRouter; deterministic mock when no key is set.
+- **LLM:** provider chain resolved by `utils/llm_provider.py` -- OpenAI (`ChatOpenAI`) -> Groq (`ChatGroq`) -> Ollama (`ChatOllama`, local) -> deterministic mock. Also used by the legacy analyst via OpenRouter.
 - **Vector store:** ChromaDB persistent index, `sentence-transformers/all-MiniLM-L6-v2` embeddings.
 - **Multi-agent orchestration:** LangGraph supervisor pattern.
 - **Structured outputs:** Pydantic + `with_structured_output`.
@@ -40,16 +40,27 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Optional, for real LLM calls (everything still works without these):
+Optional, for real LLM calls (everything still works without these). The
+analyst, LangGraph supervisor, and Ragas judge all resolve the same provider
+chain -- **OpenAI -> Groq -> Ollama -> mock** (first configured/reachable wins):
 
 ```bash
 # bash / zsh
-export OPENAI_API_KEY=sk-...
-export OPENROUTER_API_KEY=or-...
+export OPENAI_API_KEY=sk-...          # OpenAI, or:
+export GROQ_API_KEY=gsk-...           # Groq, or:
+# Ollama needs no key -- just `ollama serve` + `ollama pull llama3.1` locally.
+export OPENROUTER_API_KEY=or-...      # used only by the legacy analyst path
 
 # PowerShell
 $env:OPENAI_API_KEY="sk-..."
+$env:GROQ_API_KEY="gsk-..."
 $env:OPENROUTER_API_KEY="or-..."
+```
+
+Force a specific provider (falls back to mock if it isn't actually available):
+
+```bash
+export LLM_PROVIDER=openai   # or groq | ollama | mock
 ```
 
 ## Run it
@@ -66,15 +77,15 @@ $env:OPENROUTER_API_KEY="or-..."
 
 ## How the LangGraph supervisor decides
 
-Without an LLM key, the supervisor uses a deterministic rule:
+Without an available LLM provider, the supervisor uses a deterministic rule:
 
 - No analysis yet -> `analyst`.
 - Question mentions `deck` / `slides` / `presentation` / `powerpoint` / `ppt` and no deck yet -> `presenter`.
 - Otherwise -> `FINISH`.
 
-With `OPENAI_API_KEY` set, the supervisor instead uses
-`ChatOpenAI(...).with_structured_output(RouterDecision)` to route between
-`analyst`, `presenter`, and `FINISH`.
+With a provider resolved (OpenAI -> Groq -> Ollama), the supervisor instead
+uses `.with_structured_output(RouterDecision)` to route between `analyst`,
+`presenter`, and `FINISH`.
 
 ## Dataset
 
@@ -101,18 +112,24 @@ The 100-question bank at `data/evaluation_questions.json` includes
 `python main.py ragas` scores:
 
 - **Faithfulness**, **ResponseRelevancy**, **LLMContextPrecisionWithoutReference**, **LLMContextRecall**.
-  Requires an LLM judge; without `OPENAI_API_KEY` it writes a `{"status": "skipped"}` placeholder.
+  Requires an LLM judge (OpenAI -> Groq -> Ollama); with none available it writes a `{"status": "skipped"}` placeholder.
 
 ## Mock vs real
 
-| Component | With API key | Without |
+| Component | With a provider (OpenAI/Groq/Ollama) | Without |
 |---|---|---|
 | Old analyst (`answer_question`) | Calls OpenRouter | Deterministic JSON from prompt+model hash |
-| New analyst (`run_analyst_lc`) | `ChatOpenAI` with structured output | Mock JSON coerced into `AnalystAnswer` |
+| New analyst (`run_analyst_lc`) | Structured output via `utils/llm_provider.get_chat_model()` | Mock JSON coerced into `AnalystAnswer` |
 | Supervisor routing | LLM picks the next agent | Rule-based |
 | LLM-as-judge (legacy eval) | Real judge model | Rubric-based heuristic |
 | Ragas | Real Faithfulness/Relevancy/Context scores | Skips cleanly |
 | Embeddings | MiniLM (local) | MiniLM (local) |
+
+**Note:** structured-output reliability varies by model. OpenAI consistently
+fills every field; smaller local models (tested with Ollama's `mistral:latest`)
+can return a technically valid but sparse `AnalystAnswer` (e.g. empty
+`key_findings`) rather than raising -- this is treated as a genuine (if
+lower-quality) answer, not silently replaced with the mock.
 
 ## Deployment
 

@@ -2,13 +2,13 @@
 
 A supervisor node routes between an ``analyst`` node (structured RAG answer) and
 a ``presenter`` node (PowerPoint deck), looping back to the supervisor after each
-until it decides to ``FINISH``. Routing uses an LLM when ``OPENAI_API_KEY`` is
-present and a deterministic rule otherwise, so the graph runs fully offline.
+until it decides to ``FINISH``. Routing uses an LLM when a provider is available
+(OpenAI -> Groq -> Ollama, via :func:`utils.llm_provider.get_chat_model`) and a
+deterministic rule otherwise, so the graph runs fully offline.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -92,14 +92,15 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
     analyst_output = state.get("analyst_output")
     presentation_path = state.get("presentation_path")
 
-    if os.getenv("OPENAI_API_KEY"):
-        try:
-            from langchain_openai import ChatOpenAI
+    from utils.llm_provider import get_chat_model
 
-            router = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(RouterDecision)
+    choice = get_chat_model()
+    if choice is not None:
+        try:
+            router = choice.llm.with_structured_output(RouterDecision)
             decision = router.invoke(_supervisor_prompt(state))
             return {"next_agent": decision.next_agent}
-        except Exception:  # pragma: no cover - network/key dependent
+        except Exception:  # pragma: no cover - network/key/model dependent
             pass  # fall through to the deterministic rule
 
     return {"next_agent": _rule_based_route(question, analyst_output, presentation_path)}

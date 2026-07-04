@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,15 +49,46 @@ DEFAULT_LC_PROMPT_STYLE = "evidence_constrained"
 _CONFIDENCE_TO_FLOAT = {"low": 0.3, "medium": 0.6, "high": 0.9}
 
 
-def build_analyst_prompt(question: str, prompt_style: str, context: str, rag_enabled: bool = True) -> str:
+def build_analyst_prompt(
+    question: str,
+    prompt_style: str,
+    context: str,
+    rag_enabled: bool = True,
+    for_structured_output: bool = False,
+) -> str:
     """Construct the analyst prompt shared by the legacy and LangChain paths.
 
     Kept identical to the original ``AnalystRAGAgent._build_prompt`` template so
     the deterministic mock generator in :mod:`utils.llm_client` continues to
     parse the prompt markers (``Prompt style:`` / ``Question:`` / etc.).
+
+    ``for_structured_output=True`` omits the trailing legacy-JSON-schema block.
+    That block is only needed to steer models that return raw text (the mock
+    generator, or a model without tool-calling support). When a real call goes
+    through ``with_structured_output(AnalystAnswer)``, the model fills fields
+    via tool-calling driven by the Pydantic schema itself -- the competing
+    "return this other JSON shape" instruction has been observed (with local
+    Ollama models such as Mistral) to make the model dump that legacy JSON as a
+    string into the ``answer`` field instead of populating ``key_findings`` /
+    ``recommendations`` / ``metrics_cited`` properly. OpenAI's structured output
+    tends to ignore the competing instruction, but weaker models don't.
     """
     instruction = PROMPT_STYLES[prompt_style]
     context_block = context if rag_enabled and context else "RAG disabled. Respond from general statistical reasoning only."
+    schema_epilogue = (
+        ""
+        if for_structured_output
+        else """
+
+Return JSON in exactly this schema:
+{
+  "summary": "short paragraph",
+  "key_insights": ["insight 1", "insight 2"],
+  "patterns": ["pattern 1", "pattern 2"],
+  "recommendations": ["recommendation 1", "recommendation 2"],
+  "confidence": "high"
+}"""
+    )
     return f"""
 {instruction}
 
@@ -69,16 +99,7 @@ Question:
 {question}
 
 Dataset context:
-{context_block}
-
-Return JSON in exactly this schema:
-{{
-  "summary": "short paragraph",
-  "key_insights": ["insight 1", "insight 2"],
-  "patterns": ["pattern 1", "pattern 2"],
-  "recommendations": ["recommendation 1", "recommendation 2"],
-  "confidence": "high"
-}}
+{context_block}{schema_epilogue}
 """.strip()
 
 
@@ -234,10 +255,12 @@ def _legacy_context_text(page_content: str) -> str:
 def run_analyst_lc(question: str, use_rag: bool = True) -> dict[str, Any]:
     """LangChain-native analyst entry point returning a structured dict.
 
-    Prefers ``ChatOpenAI(...).with_structured_output(AnalystAnswer)``. When no
-    ``OPENAI_API_KEY`` is set or the API call fails, it falls back to the
-    project's deterministic mock generator so the path works offline / key-free.
-    Returns ``AnalystAnswer`` fields plus the retrieved context strings.
+    Prefers a real chat model resolved by :func:`utils.llm_provider.get_chat_model`
+    (OpenAI -> Groq -> Ollama, in that priority order) via
+    ``.with_structured_output(AnalystAnswer)``. When no provider is configured/
+    reachable, or the call fails, it falls back to the project's deterministic
+    mock generator so the path works offline / key-free. Returns ``AnalystAnswer``
+    fields plus the retrieved context strings and the model that actually answered.
     """
     docs: list[Any] = []
     if use_rag:
@@ -249,22 +272,45 @@ def run_analyst_lc(question: str, use_rag: bool = True) -> dict[str, Any]:
     # Plain legacy-form lines (no index/pipe prefix) so the mock generator's
     # row parser can read them directly; a real LLM reads them equally well.
     context = "\n".join(_legacy_context_text(doc.page_content) for doc in docs)
-    prompt = build_analyst_prompt(question, DEFAULT_LC_PROMPT_STYLE, context, rag_enabled=use_rag)
+    # Kept with the legacy JSON-schema epilogue: the mock generator's context-row
+    # parser looks for the "Return JSON in exactly this schema:" marker.
+    mock_prompt = build_analyst_prompt(question, DEFAULT_LC_PROMPT_STYLE, context, rag_enabled=use_rag)
+    # Epilogue omitted: real structured-output calls fill AnalystAnswer's fields
+    # via tool-calling: a competing "return this other JSON shape" instruction
+    # has been observed to make weaker local models (e.g. Ollama/Mistral) dump
+    # that legacy JSON as a string into `answer` instead of populating
+    # key_findings/recommendations/metrics_cited properly.
+    structured_prompt = build_analyst_prompt(
+        question, DEFAULT_LC_PROMPT_STYLE, context, rag_enabled=use_rag, for_structured_output=True
+    )
 
+    from utils.llm_provider import get_chat_model
+
+    # TODO(review): weaker/local tool-calling models (verified with Ollama's
+    # mistral:latest) sometimes return a technically-valid AnalystAnswer with
+    # empty key_findings/recommendations and the default confidence, rather
+    # than raising. We intentionally do NOT treat that as a failure and fall
+    # back to mock -- doing so would mask genuine (if lower-quality) model
+    # behavior from evaluation, which is the opposite of what the benchmark is
+    # for. If low-effort structured answers become a problem in practice,
+    # revisit with an explicit quality check here rather than silent discard.
     answer: AnalystAnswer | None = None
-    if os.getenv("OPENAI_API_KEY"):
+    model_name = "mock"
+    choice = get_chat_model()
+    if choice is not None:
         try:
-            from langchain_openai import ChatOpenAI
-
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(AnalystAnswer)
-            answer = llm.invoke(prompt)  # type: ignore[assignment]
-        except Exception:  # pragma: no cover - network/key dependent
+            structured_llm = choice.llm.with_structured_output(AnalystAnswer)
+            answer = structured_llm.invoke(structured_prompt)  # type: ignore[assignment]
+            model_name = choice.model_name
+        except Exception:  # pragma: no cover - network/key/model dependent
             answer = None
 
     if answer is None:
-        answer = _mock_analyst_answer(prompt)
+        answer = _mock_analyst_answer(mock_prompt)
+        model_name = "mock"
 
     return {
         **answer.model_dump(),
         "retrieved_contexts": [doc.page_content for doc in docs],
+        "model_name": model_name,
     }

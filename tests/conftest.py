@@ -14,5 +14,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Force offline mock paths: no LLM calls, deterministic behavior.
-for key in ("OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+for key in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY"):
     os.environ.pop(key, None)
+
+# utils.llm_provider.get_chat_model() also checks for a locally-reachable Ollama
+# server, independent of any API key. A dev machine with Ollama running would
+# otherwise make tests non-deterministic (and slow). Force the mock path.
+os.environ["LLM_PROVIDER"] = "mock"
