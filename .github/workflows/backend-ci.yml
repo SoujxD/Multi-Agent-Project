@@ -1,10 +1,15 @@
-name: CI
+name: Backend CI
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+
+env:
+  # Headless matplotlib backend: agents/presentation_agent.py renders charts,
+  # and CI runners have no display server.
+  MPLBACKEND: Agg
 
 jobs:
   test:
@@ -30,5 +35,15 @@ jobs:
         run: ruff check . --output-format=github
         continue-on-error: true
 
-      - name: Run tests
-        run: pytest -v
+      - name: Run backend + core test suite
+        run: pytest tests/ backend/tests/ -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t multi-agent-backend:ci .

@@ -9,6 +9,13 @@ import os
 import sys
 from pathlib import Path
 
+# Force the non-interactive Agg backend before matplotlib is imported anywhere
+# (agents/presentation_agent.py uses it to render charts). Without this, a
+# machine with a display can select an interactive Tkinter backend, which
+# raises "main thread is not in main loop" during interpreter teardown when
+# charts are generated off the main thread (e.g. via FastAPI's TestClient).
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 # Make the repo root importable (so `import agents...` / `import evaluation...` work).
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
